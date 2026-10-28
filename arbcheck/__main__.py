@@ -7,6 +7,8 @@ quote rather than estimated.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import subprocess
 import sys
@@ -186,23 +188,84 @@ def cmd_quote(args):
 
 
 def cmd_sweep(args):
+    """Quote historical samples.
+
+    With ``--json``, stdout is one stable document: ``chain``, ``pair``, and
+    ``sizes`` describe the request; ``blocks`` has one item per sampled block
+    with ``quotes`` (tagged by size), ``best.by_size`` (one result per size),
+    and ``gas_usd``; ``summary`` reports successful and failed block/size samples.
+    A missing gas price is represented by ``gas_usd: null`` and a sibling
+    ``gas_usd_reason`` string. No timestamp or human progress text is emitted.
+    """
     chain = get_chain(args.chain)
     rpc = _rpc(args)
     head = int(rpc.call("eth_blockNumber", []), 16)
     spacing = args.spacing
     blocks = [hex(head - i * spacing) for i in range(args.blocks)]
     sizes = [float(s) for s in args.sizes.split(",")]
-    rows = []
+    blocks_by_number = {}
+    successes = 0
+    failures = 0
     for block in blocks:
+        block_result = {"block": block, "quotes": [], "best": {"by_size": {}},
+                        "gas_usd": None, "gas_usd_reason": "gas could not be priced"}
         for size in sizes:
             ns = argparse.Namespace(**vars(args))
             ns.block, ns.size = block, size
-            ns.json = False
-            print(f"\n=== block {block} · {size:g} {args.pair.split('/')[0]}")
-            cmd_quote(ns)
-            rows.append((block, size))
-    print(f"\nswept {len(rows)} combinations; raw quotes above are per block, "
-          "not an aggregate claim")
+            ns.json = args.json
+            if not args.json:
+                print(f"\n=== block {block} · {size:g} {args.pair.split('/')[0]}")
+                status = cmd_quote(ns)
+                successes += status == 0
+                failures += status != 0
+                continue
+
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                status = cmd_quote(ns)
+            output = captured.getvalue()
+            report = None
+            if status == 0:
+                start = output.rfind("\n{")
+                if start >= 0:
+                    report, _ = json.JSONDecoder().raw_decode(output[start + 1:])
+            if report is None:
+                failures += 1
+                block_result["quotes"].append({"size": size, "error": output.strip() or
+                                               "quote did not produce a report"})
+                block_result["best"]["by_size"][str(size)] = {"error": "no complete quote"}
+                continue
+
+            successes += 1
+            block_result["quotes"].extend({"size": size, **quote}
+                                          for quote in report.get("quotes", []))
+            best = report.get("best", {})
+            best_result = {"size": size, **best}
+            if best.get("net_usd") is None:
+                best_result["net_usd_reason"] = "gas could not be priced"
+            block_result["best"]["by_size"][str(size)] = best_result
+            net = best.get("net_usd")
+            gross = best.get("gross_usd")
+            if net is not None and gross is not None:
+                block_result["gas_usd"] = gross - net
+                block_result["gas_usd_reason"] = None
+            elif net is None:
+                block_result["gas_usd"] = None
+                block_result["gas_usd_reason"] = "gas could not be priced"
+        blocks_by_number[block] = block_result
+
+    if args.json:
+        print(json.dumps({
+            "chain": chain.key,
+            "pair": args.pair,
+            "sizes": sizes,
+            "blocks": list(blocks_by_number.values()),
+            "summary": {"samples": len(blocks) * len(sizes),
+                        "successful_samples": successes, "failed_samples": failures},
+        }, indent=2))
+    else:
+        print(f"\nswept {successes + failures} combinations; raw quotes above are per block, "
+              "not an aggregate claim")
     return 0
 
 
@@ -249,6 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--spacing", type=int, default=64, help="blocks between samples")
     s.add_argument("--gas-units", type=int, default=DEFAULT_GAS_UNITS)
     s.add_argument("--eth-usd", type=float, default=None)
+    s.add_argument("--json", action="store_true", help="emit one machine-readable JSON document")
     s.set_defaults(func=cmd_sweep)
 
     r = sub.add_parser("replay", help="print (or run) the no-broadcast fork proof")

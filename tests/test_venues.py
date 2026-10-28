@@ -1,4 +1,8 @@
+import contextlib
+import io
+import json
 import unittest
+from unittest import mock
 
 from bot.abi import word
 from venues import (PoolRef, QUOTE_V3_SELECTOR, QUOTE_V4_SELECTOR,
@@ -212,6 +216,51 @@ class CliTests(unittest.TestCase):
         (token_in, token_out) = _pair(get_chain("base"), "USDC/WETH")
         self.assertEqual(token_in[1], 6)
         self.assertEqual(token_out[1], 18)
+
+    def test_sweep_json_is_one_stable_document_for_stubbed_quotes(self):
+        from arbcheck import __main__ as cli
+
+        class SweepRpc:
+            def call(self, method, params):
+                self.asserted = (method, params)
+                return hex(1000)
+
+        def quote(args):
+            self.assertTrue(args.json)
+            payload = {
+                "quotes": [{"venue": "uniswap-v3", "pool": "pool-a", "price": args.size}],
+                "best": {"buy": "uniswap-v3", "sell": "uniswap-v4",
+                         "gross_usd": 1.25, "net_usd": None},
+            }
+            print("diagnostic text that must stay off the JSON stream")
+            print(json.dumps(payload))
+            return 0
+
+        args = cli.build_parser().parse_args([
+            "sweep", "--pair", "USDC/WETH", "--sizes", "1,2", "--blocks", "1", "--json",
+        ])
+        output = io.StringIO()
+        with mock.patch.object(cli, "_rpc", return_value=SweepRpc()), \
+                mock.patch.object(cli, "cmd_quote", side_effect=quote), \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(cli.cmd_sweep(args), 0)
+
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["chain"], "base")
+        self.assertEqual(result["pair"], "USDC/WETH")
+        self.assertEqual(result["sizes"], [1.0, 2.0])
+        self.assertEqual(len(result["blocks"]), 1)
+        self.assertEqual(result["blocks"][0]["block"], "0x3e8")
+        self.assertEqual([quote["size"] for quote in result["blocks"][0]["quotes"]], [1.0, 2.0])
+        best_by_size = result["blocks"][0]["best"]["by_size"]
+        self.assertEqual(set(best_by_size), {"1.0", "2.0"})
+        self.assertEqual(best_by_size["1.0"]["net_usd_reason"],
+                         "gas could not be priced")
+        self.assertIsNone(result["blocks"][0]["gas_usd"])
+        self.assertEqual(result["blocks"][0]["gas_usd_reason"], "gas could not be priced")
+        self.assertEqual(result["summary"], {
+            "samples": 2, "successful_samples": 2, "failed_samples": 0,
+        })
 
 
 if __name__ == "__main__":
